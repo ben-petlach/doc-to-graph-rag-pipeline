@@ -2,6 +2,7 @@
 [ ] define schema beforehand. Compare that vs. default extractor vs. providing schema from JSON file
  - to optimize, you should be able to define them yourself and see how the LLM compares to it.
  - that includes node features and edge features
- 
+ - Regarding limitations: can tell it to have 10 node types, and 20 edge types to "anchor" it. But it shouldn't be too much more bloated than that due to LLM restrictions
+
 [ ] speed analysis / page
 [ ] test on receipts, invoices, parts of novels, scientific papers, etc. to see how it performs on different types of documents
