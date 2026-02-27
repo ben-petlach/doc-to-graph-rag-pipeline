@@ -6,11 +6,10 @@
 root/
 ├── .env
 ├── pipeline/
-│   ├── data/               # input documents (PDFs, text files)
+│   ├── data/               # input documents and OCR outputs (.txt)
 │   ├── kg_builder.py       # builds the knowledge graph (existing)
 │   ├── vector_cypher_rag.py # RAG pipeline (existing)
-│   ├── ocr_preprocessor.py # NEW: converts scanned docs to text/PDF
-│   └── setup_indexes.py    # NEW: creates Neo4j vector index
+│   └── ocr_preprocessor.py # NEW: converts scanned/image docs to .txt
 ```
 
 ---
@@ -19,11 +18,11 @@ root/
 
 ### Stage 1 — Document Ingestion & Preprocessing
 
-Your existing `kg_builder.py` already handles standard PDFs via `from_pdf=True`. The only gap is **scanned documents** that need OCR. Add a lightweight preprocessing step before the pipeline runs.
+Add a lightweight preprocessing step before the graph-building pipeline runs.
 
-**New file: `ocr_preprocessor.py`**
+**File: `ocr_preprocessor.py`**
 
-Use `pytesseract` + `pdf2image` to convert scanned PDFs or images into text-searchable PDFs (or plain `.txt` files). The output drops into `pipeline/data/` just like any other document, so the rest of the pipeline is untouched. The simple decision tree is: if the document is already a native PDF, pass it straight through. If it's a scanned PDF or image, run OCR and save a cleaned version.
+Use `pytesseract` + `pdf2image` to convert scanned PDFs or images into plain `.txt` files. The `.txt` outputs are written into `pipeline/data/`, and `kg_builder.py` then operates on those text files with `from_pdf=False`.
 
 **Dependencies to add:** `pytesseract`, `pdf2image`, `Pillow`
 
@@ -35,7 +34,7 @@ This is almost entirely covered by your existing `kg_builder.py`. A few intentio
 
 **Keep the schema general-purpose.** Your current `SimpleKGPipeline` has no schema passed in, which means the LLM freely identifies entity types. This is the right call for a general document intelligence system — adding a fixed schema would limit it to specific domains.
 
-**One index, set it up once.** Create `setup_indexes.py` that runs the following Cypher once against your database:
+**One index, set it up once.** Before running the pipeline, manually create a Neo4j vector index by running the following Cypher once against your database (for example in Neo4j Browser or `cypher-shell`):
 
 ```cypher
 CREATE VECTOR INDEX chunkEmbedding IF NOT EXISTS
@@ -46,9 +45,9 @@ OPTIONS {indexConfig: {
 }};
 ```
 
-This file only needs to be run one time on a fresh database. It doesn't need to be part of the ingestion loop.
+This only needs to be run one time on a fresh database. It doesn't need to be part of the ingestion loop.
 
-**Processing multiple documents.** Wrap the `kg_builder.run_async()` call in a simple loop over `pipeline/data/` so you can drop in multiple files and process them all in one run. The `SimpleKGPipeline` already tags chunks with their source document, so provenance is preserved automatically.
+**Processing multiple documents.** Wrap the `kg_builder.run_async()` call in a simple loop over `pipeline/data/` so you can drop in multiple `.txt` files and process them all in one run. The `SimpleKGPipeline` already tags chunks with their source document, so provenance is preserved automatically.
 
 ---
 
@@ -72,8 +71,7 @@ The `query_text` is the only thing that changes per user query, so you can expos
 
 | File | Responsibility |
 |---|---|
-| `ocr_preprocessor.py` | Convert scanned/image docs to processable format |
-| `setup_indexes.py` | One-time Neo4j vector index creation |
+| `ocr_preprocessor.py` | Convert scanned/image docs to `.txt` files |
 | `kg_builder.py` | Ingest docs → chunk → embed → extract entities → write graph |
 | `vector_cypher_rag.py` | Query graph → retrieve context → generate answer |
 
@@ -95,10 +93,10 @@ The `query_text` is the only thing that changes per user query, so you can expos
 
 ## Implementation Order
 
-1. Run `setup_indexes.py` once on your Neo4j instance
-2. Drop documents into `pipeline/data/`
-3. Run `ocr_preprocessor.py` on any scanned files (outputs cleaned versions back to `data/`)
-4. Run `kg_builder.py` to populate the graph
-5. Run `vector_cypher_rag.py` with your query to get a grounded answer
+1. Manually create the Neo4j vector index on your instance using the Cypher snippet above.
+2. Drop documents (PDFs or images) into `pipeline/data/`.
+3. Run `ocr_preprocessor.py` to generate `.txt` files in `pipeline/data/`.
+4. Run `kg_builder.py` to populate the graph using the `.txt` files (`from_pdf=False`).
+5. Run `vector_cypher_rag.py` with your query to get a grounded answer.
 
 That's the full pipeline end-to-end. No orchestration framework needed — the linear run order is simple enough to execute manually or wrap in a single `main.py` entry point if desired.

@@ -27,15 +27,15 @@ MATCH (node)-[:FROM_DOCUMENT]->(d)
 RETURN
     node.text as text, score,
     d.path as source_path,
-    collect { 
+    collect {
         MATCH (node)<-[:FROM_CHUNK]-(entity)-[r]->(other)-[:FROM_CHUNK]->()
         WITH toStringList([
-            labels(entity)[2], 
+            [l IN labels(entity) WHERE l <> 'Chunk' AND l <> '__Entity__' | l][0],
             entity.name, 
             entity.type, 
             entity.description, 
             type(r), 
-            labels(other)[2], 
+            [l IN labels(other) WHERE l <> 'Chunk' AND l <> '__Entity__' | l][0],
             other.name, 
             other.type, 
             other.description
@@ -60,7 +60,7 @@ llm = OpenAILLM(model_name="gpt-4o")
 rag = GraphRAG(retriever=retriever, llm=llm)
 
 # Search
-query_text = "What are proposed solutions for this challenge?"
+query_text = "Is there any relation between the text proposing solutions for Northcrest, and the document talking about debates?"
 
 response = rag.search(
     query_text=query_text, 
@@ -69,7 +69,7 @@ response = rag.search(
 )
 
 print(response.answer)
-print("CONTEXT:", response.retriever_result.items)
+# print("CONTEXT:", response.retriever_result.items)
 
 # Close the database connection
 driver.close()
