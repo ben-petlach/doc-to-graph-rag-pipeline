@@ -1,14 +1,53 @@
 # Document-to-Graph Pipeline
 
-This project builds a knowledge graph from documents and exposes a simple RAG-style query interface on top of Neo4j.
+This project builds a knowledge graph from documents and exposes a RAG-style query interface on top of Neo4j.
 
-## Scripts
+## FastAPI service
+
+Run the API (from the project root) after installing dependencies and setting up `.env`:
+
+```bash
+uvicorn main:app --reload
+```
+
+Interactive API docs are available at:
+
+- Swagger UI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+### Key endpoints
+
+- **Upload document**
+  - **POST** `/api/v1/documents/upload`
+  - Body: `multipart/form-data` with `file`
+  - Saves the file to `pipeline/data/` and marks it as `uploaded`.
+
+- **List documents**
+  - **GET** `/api/v1/documents`
+  - Returns all known files and their current stage (e.g. `uploaded`, `ocr_complete`, `indexed`, `failed`).
+
+- **Delete document**
+  - **DELETE** `/api/v1/documents/{filename}`
+  - Removes the file from `pipeline/data/` and any derived OCR output in `pipeline/output/`.
+
+- **Trigger pipeline (OCR → KG ingestion)**
+  - **POST** `/api/v1/pipeline/process`
+  - JSON body: `{"force_reprocess": false}`
+  - Starts a background job that OCRs and ingests all supported files in `pipeline/data/`, and returns a `task_id` immediately.
+
+- **Check pipeline status**
+  - **GET** `/api/v1/pipeline/status/{task_id}`
+  - Returns overall status and progress for the background job.
+
+- **RAG query**
+  - **POST** `/api/v1/chat/query`
+  - JSON body: `{"query": "...", "top_k": 5}`
+  - Returns an answer plus the underlying sources from the Neo4j graph.
+
+## Legacy scripts
 
 - `pipeline/ocr_preprocessor.py` – OCR PDFs/images in `pipeline/data/` into `.txt` files.
 - `pipeline/kg_builder.py` – Ingest `.txt` files, build embeddings, and write the graph to Neo4j.
 - `pipeline/vector_cypher_rag.py` – Run a RAG query over the graph and print the answer plus context.
-
-Each script is meant to be run directly (for example, `python pipeline/kg_builder.py`) and stays small and self-contained.
 
 ## Environment
 
