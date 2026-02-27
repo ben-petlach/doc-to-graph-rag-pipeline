@@ -10,6 +10,7 @@ DEFAULT_RATE_LIMIT_HANDLER = RetryRateLimitHandler(
 )
 """
 # hopefully in production we'll have better rate limits.
+
 # another potential solution is to use a "cheaper" embedding model
 
 import os
@@ -47,12 +48,24 @@ text_splitter = FixedSizeSplitter(chunk_size=500, chunk_overlap=100) #chunk over
 kg_builder = SimpleKGPipeline(
     llm=llm,
     driver=neo4j_driver, 
-    neo4j_database=os.getenv("NEO4J_DATABASE"), 
-    embedder=embedder, 
-    from_pdf=True,
+    neo4j_database=os.getenv("NEO4J_DATABASE"),
+    embedder=embedder,
+    from_pdf=False,
     text_splitter=text_splitter
 )
 
-pdf_file = "./pipeline/data/report.pdf"
-result = asyncio.run(kg_builder.run_async(file_path=pdf_file))
-print(result.result)
+DATA_DIR = "./pipeline/output"
+
+text_files = [
+    os.path.join(DATA_DIR, name)
+    for name in os.listdir(DATA_DIR)
+    if name.lower().endswith(".txt")
+]
+
+for text_file in text_files:
+    with open(text_file, "r", encoding="utf-8") as f:
+        text = f.read()
+    result = asyncio.run(kg_builder.run_async(text=text))
+    print(text_file, result.result)
+
+neo4j_driver.close()
