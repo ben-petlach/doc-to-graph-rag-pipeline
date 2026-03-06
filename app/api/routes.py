@@ -9,6 +9,8 @@ import anyio
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from neo4j_graphrag.experimental.components.schema import GraphSchema
+
 from app.core.config import Settings
 from app.core.file_utils import sanitize_filename
 from app.core.task_registry import InMemoryRegistry
@@ -36,13 +38,16 @@ def _get_graph_qa(request: Request) -> GraphQA:
 
 
 class UploadResponse(BaseModel):
+    file_id: str
     filename: str
     status: str
 
 
 class FileInfo(BaseModel):
+    id: str
     name: str
     stage: str
+    date_uploaded: str
     error: Optional[str] = None
 
 
@@ -100,8 +105,8 @@ async def upload_document(request: Request, file: UploadFile = File(...)) -> Upl
     contents = await file.read()
     dest_path.write_bytes(contents)
 
-    registry.set_file_stage(filename=safe_name, stage="uploaded")
-    return UploadResponse(filename=safe_name, status="uploaded")
+    file_id = registry.set_file_stage(filename=safe_name, stage="uploaded")
+    return UploadResponse(file_id=file_id, filename=safe_name, status="uploaded")
 
 
 @router.get("/documents", tags=["Documents"], response_model=ListFilesResponse)
@@ -110,27 +115,46 @@ async def list_documents(request: Request) -> ListFilesResponse:
     registry = _get_registry(request)
 
     registry.sync_files_from_disk(data_dir=settings.data_dir)
-    files = [FileInfo(name=r.name, stage=r.stage, error=r.error) for r in registry.list_files()]
-    files.sort(key=lambda x: x.name.lower())
+    files = [
+        FileInfo(
+            id=r.id,
+            name=r.name,
+            stage=r.stage,
+            date_uploaded=r.date_uploaded,
+            error=r.error
+        ) 
+        for r in registry.list_files() 
+        if r.stage != "deleted"
+    ]
+    files.sort(key=lambda x: x.date_uploaded, reverse=True)
     return ListFilesResponse(files=files)
 
 
-@router.delete("/documents/{filename}", tags=["Documents"], response_model=DeleteResponse)
-async def delete_document(request: Request, filename: str) -> DeleteResponse:
+@router.delete("/documents/{file_id}", tags=["Documents"], response_model=DeleteResponse)
+async def delete_document(request: Request, file_id: str) -> DeleteResponse:
     settings = _get_settings(request)
     registry = _get_registry(request)
 
-    name = _validate_path_param_filename(filename)
-    raw_path = settings.data_dir / name
+    # Get file record to find the filename
+    file_record = registry.get_file_by_id(file_id=file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    if file_record.stage == "deleted":
+        raise HTTPException(status_code=404, detail="File already deleted")
+
+    # Delete the actual files
+    raw_path = settings.data_dir / file_record.name
     if raw_path.exists():
         raw_path.unlink()
 
-    out_path = settings.output_dir / f"{Path(name).stem}.txt"
+    out_path = settings.output_dir / f"{Path(file_record.name).stem}.txt"
     if out_path.exists():
         out_path.unlink()
 
-    registry.delete_file_record(filename=name)
-    return DeleteResponse(message="Deleted")
+    # Mark as deleted in registry
+    registry.delete_file_by_id(file_id=file_id)
+    return DeleteResponse(message=f"Deleted {file_record.name}")
 
 
 async def _run_pipeline_job(
@@ -154,8 +178,10 @@ async def _run_pipeline_job(
     registry.update_task(task_id=task_id, status="processing", processed_files=0, total_files=len(files))
 
     errors: list[str] = []
-    processed = 0
-
+    
+    # Step 1: Extract text from all files
+    extracted_texts: list[tuple[str, str]] = []  # [(text, filename), ...]
+    
     for fp in files:
         registry.set_file_stage(filename=fp.name, stage="processing")
         try:
@@ -165,17 +191,52 @@ async def _run_pipeline_job(
                     output_dir=output_dir,
                     write_output=True,
                     force=force_reprocess,
+                    ocr_min_confidence=settings.ocr_min_confidence,
+                    mistral_api_key=settings.mistral_api_key,
                 ),
                 fp,
             )
             registry.set_file_stage(filename=fp.name, stage="ocr_complete")
-
-            await ingestion_service.ingest_text(text=text, filename=fp.name)
-            registry.set_file_stage(filename=fp.name, stage="indexed")
+            extracted_texts.append((text, fp.name))
         except Exception as e:
             msg = f"{fp.name}: {e}"
             errors.append(msg)
             registry.set_file_stage(filename=fp.name, stage="failed", error=str(e))
+
+    # Step 2: Generate schema from sample text
+    if extracted_texts:
+        sample_text = ""
+        for text, _ in extracted_texts:
+            sample_text += text + "\n\n"
+            if len(sample_text) >= settings.kg_schema_sample_size:
+                break
+        sample_text = sample_text[:settings.kg_schema_sample_size]
+        
+        try:
+            registry.set_file_stage(filename="__schema__", stage="generating_schema")
+            schema = await ingestion_service.generate_schema(sample_text=sample_text)
+            
+            # Save the generated schema
+            schema_path = output_dir / "generated_schema.json"
+            schema.save(str(schema_path), overwrite=True)
+            registry.set_file_stage(filename="__schema__", stage="schema_complete")
+        except Exception as e:
+            msg = f"Schema generation failed: {e}"
+            errors.append(msg)
+            registry.set_file_stage(filename="__schema__", stage="failed", error=str(e))
+            # Continue without schema (will use LLM auto-extraction)
+    
+    # Step 3: Ingest all extracted texts with the generated schema
+    processed = 0
+    for text, filename in extracted_texts:
+        registry.set_file_stage(filename=filename, stage="indexing")
+        try:
+            await ingestion_service.ingest_text(text=text, filename=filename)
+            registry.set_file_stage(filename=filename, stage="indexed")
+        except Exception as e:
+            msg = f"{filename}: {e}"
+            errors.append(msg)
+            registry.set_file_stage(filename=filename, stage="failed", error=str(e))
 
         processed += 1
         registry.update_task(task_id=task_id, processed_files=processed)
@@ -227,6 +288,32 @@ async def pipeline_status(request: Request, task_id: str) -> StatusResponse:
     if rec is None:
         raise HTTPException(status_code=404, detail="Unknown task_id (server restart clears in-memory status)")
     return StatusResponse(status=rec.status, progress=rec.progress, error=rec.error)
+
+
+class SchemaInfo(BaseModel):
+    node_types: list[dict[str, Any]]
+    relationship_types: list[dict[str, Any]]
+    patterns: list[list[str]]
+
+
+@router.get("/schema", tags=["Schema"], response_model=SchemaInfo)
+async def get_schema(request: Request) -> SchemaInfo:
+    """Return the LLM-generated graph schema from the last pipeline run."""
+    settings = _get_settings(request)
+    schema_path = settings.output_dir / "generated_schema.json"
+    
+    if not schema_path.exists():
+        raise HTTPException(
+            status_code=404, 
+            detail="No schema generated yet. Run the pipeline first."
+        )
+    
+    schema = GraphSchema.from_file(str(schema_path))
+    return SchemaInfo(
+        node_types=[nt.model_dump() for nt in schema.node_types],
+        relationship_types=[rt.model_dump() for rt in schema.relationship_types],
+        patterns=list(schema.patterns),
+    )
 
 
 @router.post("/chat/query", tags=["RAG"], response_model=QueryResponse)

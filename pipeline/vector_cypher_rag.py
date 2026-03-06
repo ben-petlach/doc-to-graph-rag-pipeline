@@ -60,7 +60,7 @@ llm = OpenAILLM(model_name="gpt-4o")
 rag = GraphRAG(retriever=retriever, llm=llm)
 
 # Search
-query_text = "Is there any relation between the text proposing solutions for Northcrest, and the document talking about debates?"
+query_text = "What is the load being transferred?"
 
 response = rag.search(
     query_text=query_text, 
