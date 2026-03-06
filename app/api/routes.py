@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -17,6 +18,7 @@ from app.core.task_registry import InMemoryRegistry
 from app.services.ingestion import IngestionService
 from app.services.ocr import SUPPORTED_EXTENSIONS, extract_text_from_file
 from app.services.retrieval import GraphQA
+from pipeline.speed_analyzer import SpeedTracker
 
 
 router = APIRouter(prefix="/api/v1")
@@ -72,6 +74,7 @@ class StatusResponse(BaseModel):
     status: str
     progress: str
     error: Optional[str] = None
+    timing: Optional[dict[str, float]] = None  # {"total_seconds": 120, "avg_per_file": 10}
 
 
 class QueryRequest(BaseModel):
@@ -165,6 +168,12 @@ async def _run_pipeline_job(
     ingestion_service: IngestionService,
     force_reprocess: bool,
 ) -> None:
+    # Create speed tracker for this task
+    tracker = SpeedTracker()
+    registry.set_speed_tracker(task_id=task_id, tracker=tracker)
+    
+    job_start = time.perf_counter()
+    
     data_dir = settings.data_dir
     output_dir = settings.output_dir
 
@@ -185,6 +194,7 @@ async def _run_pipeline_job(
     for fp in files:
         registry.set_file_stage(filename=fp.name, stage="processing")
         try:
+            tracker.start(fp.name, 0, "ocr_extraction")
             text = await anyio.to_thread.run_sync(
                 partial(
                     extract_text_from_file,
@@ -196,9 +206,11 @@ async def _run_pipeline_job(
                 ),
                 fp,
             )
+            tracker.stop()
             registry.set_file_stage(filename=fp.name, stage="ocr_complete")
             extracted_texts.append((text, fp.name))
         except Exception as e:
+            tracker.stop()  # Stop tracking even on error
             msg = f"{fp.name}: {e}"
             errors.append(msg)
             registry.set_file_stage(filename=fp.name, stage="failed", error=str(e))
@@ -214,13 +226,16 @@ async def _run_pipeline_job(
         
         try:
             registry.set_file_stage(filename="__schema__", stage="generating_schema")
+            tracker.start("__schema__", 0, "schema_generation")
             schema = await ingestion_service.generate_schema(sample_text=sample_text)
+            tracker.stop()
             
             # Save the generated schema
             schema_path = output_dir / "generated_schema.json"
             schema.save(str(schema_path), overwrite=True)
             registry.set_file_stage(filename="__schema__", stage="schema_complete")
         except Exception as e:
+            tracker.stop()
             msg = f"Schema generation failed: {e}"
             errors.append(msg)
             registry.set_file_stage(filename="__schema__", stage="failed", error=str(e))
@@ -231,20 +246,36 @@ async def _run_pipeline_job(
     for text, filename in extracted_texts:
         registry.set_file_stage(filename=filename, stage="indexing")
         try:
+            tracker.start(filename, 0, "kg_ingestion")
             await ingestion_service.ingest_text(text=text, filename=filename)
+            tracker.stop()
             registry.set_file_stage(filename=filename, stage="indexed")
         except Exception as e:
+            tracker.stop()
             msg = f"{filename}: {e}"
             errors.append(msg)
             registry.set_file_stage(filename=filename, stage="failed", error=str(e))
 
         processed += 1
         registry.update_task(task_id=task_id, processed_files=processed)
+    
+    # Calculate total time
+    total_time = time.perf_counter() - job_start
 
     if errors:
-        registry.update_task(task_id=task_id, status="failed", error="; ".join(errors[:5]))
+        registry.update_task(
+            task_id=task_id, 
+            status="failed", 
+            error="; ".join(errors[:5]),
+            total_time_seconds=total_time
+        )
     else:
-        registry.update_task(task_id=task_id, status="completed", error=None)
+        registry.update_task(
+            task_id=task_id, 
+            status="completed", 
+            error=None,
+            total_time_seconds=total_time
+        )
 
 
 @router.post("/pipeline/process", tags=["Pipeline"], response_model=ProcessResponse)
@@ -287,7 +318,56 @@ async def pipeline_status(request: Request, task_id: str) -> StatusResponse:
     rec = registry.get_task(task_id=task_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="Unknown task_id (server restart clears in-memory status)")
-    return StatusResponse(status=rec.status, progress=rec.progress, error=rec.error)
+    
+    timing = None
+    if rec.total_time_seconds is not None:
+        timing = {
+            "total_seconds": rec.total_time_seconds,
+            "avg_per_file": rec.total_time_seconds / rec.total_files if rec.total_files > 0 else 0,
+        }
+    
+    return StatusResponse(status=rec.status, progress=rec.progress, error=rec.error, timing=timing)
+
+
+class MetricsResponse(BaseModel):
+    task_id: str
+    total_time_seconds: Optional[float] = None
+    records: list[dict[str, Any]]  # TimingRecords as dicts
+    summary: dict[str, Any]  # Summary stats by stage
+
+
+@router.get("/pipeline/metrics/{task_id}", tags=["Pipeline"], response_model=MetricsResponse)
+async def pipeline_metrics(request: Request, task_id: str) -> MetricsResponse:
+    """Get detailed timing metrics for a pipeline task."""
+    registry = _get_registry(request)
+    rec = registry.get_task(task_id=task_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Unknown task_id")
+    
+    tracker = registry.get_speed_tracker(task_id=task_id)
+    if tracker is None:
+        raise HTTPException(status_code=404, detail="No timing data available for this task")
+    
+    # Convert TimingRecords to dicts
+    records = [
+        {
+            "filename": tr.file,
+            "page": tr.page,
+            "stage": tr.stage,
+            "duration_seconds": tr.duration_seconds,
+        }
+        for tr in tracker.records
+    ]
+    
+    # Get summary stats
+    summary_dict = tracker.summary_dict()
+    
+    return MetricsResponse(
+        task_id=task_id,
+        total_time_seconds=rec.total_time_seconds,
+        records=records,
+        summary=summary_dict,
+    )
 
 
 class SchemaInfo(BaseModel):

@@ -3,7 +3,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -95,6 +95,34 @@ class SpeedTracker:
             lines.append(f"  {stage:<20} avg={avg:.4f}s  total={stage_totals[stage]:.4f}s  count={stage_counts[stage]}")
 
         return "\n".join(lines)
+
+    def summary_dict(self) -> dict[str, Any]:
+        """Return summary statistics as a dictionary."""
+        if not self._records:
+            return {"total_seconds": 0.0, "stages": {}}
+
+        total = 0.0
+        stage_totals: dict[str, float] = {}
+        stage_counts: dict[str, int] = {}
+
+        for r in self._records:
+            total += r.duration_seconds
+            stage_totals[r.stage] = stage_totals.get(r.stage, 0.0) + r.duration_seconds
+            stage_counts[r.stage] = stage_counts.get(r.stage, 0) + 1
+
+        stages = {}
+        for stage in sorted(stage_totals.keys()):
+            stages[stage] = {
+                "total_seconds": round(stage_totals[stage], 4),
+                "count": stage_counts[stage],
+                "avg_seconds": round(stage_totals[stage] / stage_counts[stage], 4),
+            }
+
+        return {
+            "total_seconds": round(total, 4),
+            "stages": stages,
+        }
+
 
     def save(self, path: str | Path) -> None:
         """Save timing data as CSV."""

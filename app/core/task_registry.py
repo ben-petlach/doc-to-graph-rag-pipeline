@@ -4,8 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from pipeline.speed_analyzer import SpeedTracker
 
 
 @dataclass(slots=True)
@@ -24,6 +27,7 @@ class TaskRecord:
     processed_files: int = 0
     total_files: int = 0
     error: Optional[str] = None
+    total_time_seconds: Optional[float] = None
 
     @property
     def progress(self) -> str:
@@ -38,6 +42,7 @@ class InMemoryRegistry:
         self._files: dict[str, FileRecord] = {}  # key: file_id
         self._files_by_name: dict[str, str] = {}  # key: filename, value: file_id
         self._tasks: dict[str, TaskRecord] = {}
+        self._speed_trackers: dict[str, "SpeedTracker"] = {}  # key: task_id
 
     def ensure_file_from_disk(self, *, filename: str) -> str:
         """Ensure file exists in registry, return its ID."""
@@ -162,6 +167,7 @@ class InMemoryRegistry:
                 processed_files=rec.processed_files,
                 total_files=rec.total_files,
                 error=rec.error,
+                total_time_seconds=rec.total_time_seconds,
             )
 
     def update_task(
@@ -172,6 +178,7 @@ class InMemoryRegistry:
         processed_files: Optional[int] = None,
         total_files: Optional[int] = None,
         error: Optional[str] = None,
+        total_time_seconds: Optional[float] = None,
     ) -> None:
         with self._lock:
             rec = self._tasks.get(task_id)
@@ -187,4 +194,16 @@ class InMemoryRegistry:
                 rec.total_files = total_files
             if error is not None:
                 rec.error = error
+            if total_time_seconds is not None:
+                rec.total_time_seconds = total_time_seconds
+
+    def set_speed_tracker(self, *, task_id: str, tracker: "SpeedTracker") -> None:
+        """Associate a SpeedTracker with a task."""
+        with self._lock:
+            self._speed_trackers[task_id] = tracker
+
+    def get_speed_tracker(self, *, task_id: str) -> Optional["SpeedTracker"]:
+        """Retrieve the SpeedTracker for a task."""
+        with self._lock:
+            return self._speed_trackers.get(task_id)
 
